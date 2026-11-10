@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rocket Camera Switch (2S)</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 20px;
+    background: #191919; color: #f0f0f0;
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    display: flex; flex-direction: column; align-items: center;
+  }
+  h1 { font-size: 1.35rem; margin: 6px 0 20px; }
+  .panel {
+    width: 100%; max-width: 440px; background: #2a2a2a;
+    border-radius: 12px; padding: 18px; margin-bottom: 14px;
+  }
+  .conn {
+    text-align: center; padding: 12px; border-radius: 8px;
+    background: #333; margin-bottom: 14px; font-weight: 600; letter-spacing: .05em;
+  }
+  .conn.on { background: #2962ff; }
+  .chan {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 16px; border-radius: 10px; margin-bottom: 10px;
+    background: #3a3a3a; font-weight: 700; letter-spacing: .05em;
+  }
+  .chan.on { background: #c5292a; }
+  .chan .state { font-size: .8rem; font-weight: 600; opacity: .85; }
+  button {
+    width: 100%; padding: 15px; border: none; border-radius: 10px;
+    font-size: 1rem; font-weight: 600; color: #fff; margin-bottom: 9px; cursor: pointer;
+  }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button:active:not(:disabled) { transform: scale(.985); }
+  .b-conn { background: #2962ff; }
+  .b-ch   { background: #7a5cc4; }
+  .b-both { background: #c5292a; }
+  .b-off  { background: #2d8f4e; }
+  .row {
+    display: flex; justify-content: space-between; padding: 7px 0;
+    font-size: .93rem; border-bottom: 1px solid #383838;
+  }
+  .row:last-child { border-bottom: none; }
+  .k { color: #8a8a8a; }
+  .v { font-weight: 600; }
+  .v.warn { color: #d4853c; }
+  .v.bad  { color: #c5292a; }
+  .banner {
+    padding: 10px; border-radius: 8px; margin-bottom: 12px;
+    text-align: center; font-size: .85rem; display: none;
+  }
+  .banner.show { display: block; }
+  .banner.fs   { background: #5a3a1a; border: 1px solid #d4853c; }
+  .banner.flt  { background: #5a1a1a; border: 1px solid #c5292a; }
+  .log {
+    font-family: ui-monospace, monospace; font-size: .72rem; color: #8a8a8a;
+    background: #101010; padding: 10px; border-radius: 6px;
+    height: 110px; overflow-y: scroll; white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+  <h1>🎥 CameraBoard-1 — 2S LiFePO4</h1>
+
+  <div class="panel">
+    <div id="conn" class="conn">DISCONNECTED</div>
+    <button id="b-conn" class="b-conn">Connect</button>
+  </div>
+
+  <div class="panel">
+    <div id="banner-fs" class="banner fs">⚠️ Force-safe button active — outputs held off.</div>
+    <div id="banner-flt" class="banner flt">⛔ 5&nbsp;V rail fault — board refused to arm.</div>
+    <div id="banner-byp" class="banner flt">⛔ BYPASS SHUNT INSTALLED — cameras forced ON, remote control disabled.</div>
+
+    <div id="chan1" class="chan">CAM 1 <span class="state">OFF</span></div>
+    <div id="chan2" class="chan">CAM 2 <span class="state">OFF</span></div>
+
+    <button id="b-ch1" class="b-ch" disabled>Toggle CAM 1</button>
+    <button id="b-ch2" class="b-ch" disabled>Toggle CAM 2</button>
+    <button id="b-both" class="b-both" disabled>BOTH ON</button>
+    <button id="b-off" class="b-off" disabled>ALL OFF</button>
+  </div>
+
+  <div class="panel">
+    <div class="row"><span class="k">Battery (2S):</span><span id="vbat" class="v">— V</span></div>
+    <div class="row"><span class="k">5 V rail:</span><span id="v5" class="v">— V</span></div>
+    <div class="row"><span class="k">Uptime:</span><span id="up" class="v">—</span></div>
+    <div class="row"><span class="k">Board:</span><span id="bid" class="v">—</span></div>
+  </div>
+
+  <div class="panel"><div id="log" class="log"></div></div>
+
+<script>
+// UUIDs for BOARD_ID = 1 (firmware XORs the first little-endian byte with BOARD_ID,
+// which is the LAST hex pair of the standard UUID string).
+const SVC_UUID    = '12345678-1234-5678-1234-56789abcda00';
+const CMD_UUID    = '12345678-1234-5678-1234-56789abcda01';
+const STATUS_UUID = '12345678-1234-5678-1234-56789abcda02';
+
+const MAGIC = [0xDE, 0xAD, 0xBE, 0xEF];
+const OP_SET = 0x00, OP_ALL_OFF = 0x01, OP_ALL_ON = 0x02;
+
+let device, server, service, cmdChar, statusChar;
+let mask = 0;
+
+const $ = id => document.getElementById(id);
+const log = m => {
+  $('log').textContent += `[${new Date().toLocaleTimeString()}] ${m}\n`;
+  $('log').scrollTop = $('log').scrollHeight;
+};
+
+function setConnected(on) {
+  $('conn').textContent = on ? 'CONNECTED' : 'DISCONNECTED';
+  $('conn').className = 'conn' + (on ? ' on' : '');
+  $('b-conn').textContent = on ? 'Disconnect' : 'Connect';
+  ['b-ch1','b-ch2','b-both','b-off'].forEach(id => $(id).disabled = !on);
+  if (!on) {
+    mask = 0;
+    render(0, null, null, null, null, false, 0);
+  }
+}
+
+function render(m, vbatMv, v5Mv, upS, boardId, forceSafe, fault) {
+  mask = m;
+
+  $('chan1').className = 'chan' + ((m & 1) ? ' on' : '');
+  $('chan1').innerHTML = 'CAM 1 <span class="state">' + ((m & 1) ? 'ON' : 'OFF') + '</span>';
+  $('chan2').className = 'chan' + ((m & 2) ? ' on' : '');
+  $('chan2').innerHTML = 'CAM 2 <span class="state">' + ((m & 2) ? 'ON' : 'OFF') + '</span>';
+
+  if (vbatMv === null) {
+    $('vbat').textContent = '— V'; $('vbat').className = 'v';
+    $('v5').textContent = '— V';   $('v5').className = 'v';
+    $('up').textContent = '—';
+    $('bid').textContent = '—';
+  } else {
+    $('vbat').textContent = (vbatMv / 1000).toFixed(2) + ' V';
+    // 2S: 8.4V full, 7.4V nominal, 6.6V getting low, 6.0V empty
+    // 2S LiFePO4: 7.3 V full, 6.4 V nominal (flat for ~90% of the discharge),
+    // 5.9 V is where the buck starts losing 5 V regulation.
+    $('vbat').className = 'v' + (vbatMv < 5900 ? ' bad' : vbatMv < 6200 ? ' warn' : '');
+
+    $('v5').textContent = v5Mv > 100 ? (v5Mv / 1000).toFixed(2) + ' V' : 'off';
+    const v5bad = v5Mv > 100 && (v5Mv < 4500 || v5Mv > 5500);
+    $('v5').className = 'v' + (v5bad ? ' bad' : '');
+
+    $('up').textContent = upS + ' s';
+    $('bid').textContent = '#' + boardId;
+  }
+
+  $('banner-fs').classList.toggle('show', !!forceSafe && fault !== 3);
+  $('banner-flt').classList.toggle('show', !!fault && fault !== 3);
+  $('banner-byp').classList.toggle('show', fault === 3);
+
+  const lock = !!forceSafe;
+  ['b-ch1','b-ch2','b-both'].forEach(id => {
+    if (!$(id).disabled || lock) $(id).disabled = lock;
+  });
+}
+
+function onStatus(e) {
+  const v = e.target.value;
+  if (v.byteLength < 10) return;
+  render(
+    v.getUint8(0),
+    (v.getUint8(1) << 8) | v.getUint8(2),
+    (v.getUint8(3) << 8) | v.getUint8(4),
+    (v.getUint8(5) << 8) | v.getUint8(6),
+    v.getUint8(8),
+    v.getUint8(7) === 1,
+    v.getUint8(9)
+  );
+  const fault = v.getUint8(9);
+  if (fault) log('Board reports fault code ' + fault);
+}
+
+async function connect() {
+  if (device && device.gatt.connected) { device.gatt.disconnect(); return; }
+  try {
+    log('Requesting device…');
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'CameraBoard' }],
+      optionalServices: [SVC_UUID],
+    });
+    device.addEventListener('gattserverdisconnected', () => {
+      log('Disconnected'); setConnected(false);
+    });
+
+    server = await device.gatt.connect();
+    service = await server.getPrimaryService(SVC_UUID);
+    cmdChar = await service.getCharacteristic(CMD_UUID);
+    statusChar = await service.getCharacteristic(STATUS_UUID);
+
+    await statusChar.startNotifications();
+    statusChar.addEventListener('characteristicvaluechanged', onStatus);
+
+    setConnected(true);
+    onStatus({ target: { value: await statusChar.readValue() } });
+    log('Connected to ' + device.name);
+  } catch (err) {
+    log('Error: ' + err.message);
+    setConnected(false);
+  }
+}
+
+async function send(opcode, arg) {
+  if (!cmdChar) return;
+  try {
+    await cmdChar.writeValue(new Uint8Array([...MAGIC, opcode, arg]));
+    log(`sent op=0x0${opcode} arg=0x0${arg}`);
+  } catch (err) {
+    log('Write failed: ' + err.message);
+  }
+}
+
+$('b-conn').addEventListener('click', connect);
+$('b-ch1').addEventListener('click', () => send(OP_SET, mask ^ 0x01));
+$('b-ch2').addEventListener('click', () => send(OP_SET, mask ^ 0x02));
+$('b-both').addEventListener('click', () => send(OP_ALL_ON, 0));
+$('b-off').addEventListener('click', () => send(OP_ALL_OFF, 0));
+
+if (!navigator.bluetooth) {
+  log('Web Bluetooth unavailable in this browser.');
+  log('Use Chrome/Edge on desktop, Chrome on Android, or Bluefy on iOS.');
+  $('b-conn').disabled = true;
+}
+setConnected(false);
+</script>
+</body>
+</html>
